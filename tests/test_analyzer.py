@@ -162,3 +162,55 @@ def test_analyze_consumes_a_one_shot_iterator():
     # Streaming: analyze() must work on a generator (single pass, no len()).
     r = analyze((ln for ln in _bruteforce_log("203.0.113.5", 6)), threshold=5)
     assert r["brute_force"][0]["failures_in_window"] == 6
+
+
+# --- "Invalid user" notice + "Failed ... for invalid user" are one attempt ---
+
+def _invalid_attempt(pid, sec, user="admin", ip="203.0.113.5", port=40001, failed=True):
+    lines = [f"Jun 10 13:55:{sec:02d} web01 sshd[{pid}]: Invalid user {user} from {ip} port {port}"]
+    if failed:
+        lines.append(f"Jun 10 13:55:{sec + 1:02d} web01 sshd[{pid}]: Failed password for "
+                     f"invalid user {user} from {ip} port {port} ssh2")
+    return lines
+
+
+def test_invalid_user_notice_and_failed_line_count_once():
+    r = analyze(_invalid_attempt(3300, 31))
+    assert r["total_failed"] == 1
+    assert r["invalid_users"] == [("admin", 1)]
+    assert r["top_offenders"] == [("203.0.113.5", 1)]
+
+
+def test_notice_without_failed_line_still_counts():
+    # Key-only servers: "Invalid user" then disconnect, no Failed line.
+    r = analyze(_invalid_attempt(3300, 31, failed=False))
+    assert r["total_failed"] == 1
+
+
+def test_retries_on_same_connection_each_count():
+    # MaxAuthTries: one notice, then several Failed lines on one connection.
+    lines = _invalid_attempt(3300, 31) + [
+        "Jun 10 13:55:35 web01 sshd[3300]: Failed password for invalid user admin "
+        "from 203.0.113.5 port 40001 ssh2"
+    ]
+    assert analyze(lines)["total_failed"] == 2
+
+
+def test_brute_force_window_not_doubled_by_notices():
+    lines = []
+    for i in range(5):
+        lines += _invalid_attempt(4000 + i, 10 + 2 * i, user=f"u{i}", port=41000 + i)
+    r = analyze(lines, threshold=5)
+    assert r["brute_force"][0]["failures_in_window"] == 5   # not 10
+
+
+def test_notice_without_pid_is_counted_directly():
+    r = analyze(["Jun 10 13:55:31 web01 sshd: Invalid user admin from 203.0.113.5"])
+    assert r["total_failed"] == 1
+
+
+def test_parse_invalid_user_notice():
+    e = parse_line("Jun 10 13:55:31 web01 sshd[3300]: Invalid user admin from 203.0.113.5 port 40001")
+    assert e["event"] == "invalid_user"
+    assert e["pid"] == "3300"
+    assert e["user"] == "admin"

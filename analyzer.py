@@ -38,6 +38,9 @@ _MONTHS = {m: i for i, m in enumerate(
 _FAILED = re.compile(r"Failed (\S+) for (invalid user )?(\S+) from (\S+)")
 _ACCEPTED = re.compile(r"Accepted (\S+) for (\S+) from (\S+)")
 _INVALID = re.compile(r"Invalid user (\S*) from (\S+)")
+# sshd forks one process per connection; its PID ties together the lines of
+# one login attempt.
+_PID = re.compile(r"sshd\[(\d+)\]")
 
 # How far back to look when inferring a syslog year. 8 years always contains
 # a leap year, so a Feb 29 entry resolves to the most recent one.
@@ -101,10 +104,12 @@ def parse_timestamp(line: str, year: int | None = None,
 
 def parse_line(line: str, year: int | None = None,
                now: datetime | None = None) -> dict | None:
-    """Parse one log line into {ts, event, method, user, ip, invalid} or None.
+    """Parse one log line into {ts, event, method, user, ip, invalid, pid} or None.
 
-    event is one of: 'failed', 'accepted'. 'Invalid user' lines also count as a
-    failed attempt and set invalid=True.
+    event is one of: 'failed', 'accepted', 'invalid_user'. An 'invalid_user'
+    line ("Invalid user X from IP") announces an attempt against a
+    non-existent account; analyze() decides whether it is a separate failure
+    or the same attempt as a following "Failed ... for invalid user" line.
     """
     m = _FAILED.search(line)
     if m:
@@ -114,10 +119,12 @@ def parse_line(line: str, year: int | None = None,
         event = {"event": "accepted", "method": m.group(1), "user": m.group(2),
                  "ip": _norm_ip(m.group(3)), "invalid": False}
     elif (m := _INVALID.search(line)):
-        event = {"event": "failed", "method": None, "user": m.group(1),
+        event = {"event": "invalid_user", "method": None, "user": m.group(1),
                  "ip": _norm_ip(m.group(2)), "invalid": True}
     else:
         return None
+    pid = _PID.search(line)
+    event["pid"] = pid.group(1) if pid else None
     event["ts"] = parse_timestamp(line, year, now)
     return event
 
@@ -155,20 +162,44 @@ def analyze(lines, threshold: int = 5, window_seconds: int = 60,
     fails_by_ip = defaultdict(list)     # ip -> [timestamps]
     accepts_by_ip = defaultdict(list)   # ip -> [timestamps]
     invalid_users = Counter()
+    # sshd logs "Invalid user X from IP" and then, for the same attempt,
+    # "Failed password for invalid user X from IP" (same PID). Counting both
+    # would double every attempt. So the notice is held here, keyed by
+    # (pid, ip, user), and dropped when its Failed line arrives. Notices with
+    # no Failed line (e.g. key-only servers that disconnect right away) still
+    # count once, when flushed.
+    pending_invalid = {}    # (pid, ip, user) -> ts
+
+    def record_failure(ip, ts, user=None):
+        nonlocal total_failed
+        total_failed += 1
+        fails_by_ip[ip].append(ts)
+        if user is not None:
+            invalid_users[user] += 1
 
     for line in lines:
         e = parse_line(line, year, now)
         if e is None:
             continue
         lines_parsed += 1
-        if e["event"] == "failed":
-            total_failed += 1
-            fails_by_ip[e["ip"]].append(e["ts"])
+        key = (e["pid"], e["ip"], e["user"])
+        if e["event"] == "invalid_user":
+            if e["pid"] is None:            # can't correlate: count it now
+                record_failure(e["ip"], e["ts"], e["user"])
+            else:
+                if key in pending_invalid:  # previous notice never got a Failed line
+                    record_failure(e["ip"], pending_invalid[key], e["user"])
+                pending_invalid[key] = e["ts"]
+        elif e["event"] == "failed":
             if e["invalid"]:
-                invalid_users[e["user"]] += 1
+                pending_invalid.pop(key, None)   # same attempt as its notice
+            record_failure(e["ip"], e["ts"], e["user"] if e["invalid"] else None)
         else:
             total_accepted += 1
             accepts_by_ip[e["ip"]].append(e["ts"])
+
+    for (_pid, ip, user), ts in pending_invalid.items():
+        record_failure(ip, ts, user)
 
     fail_count = Counter({ip: len(ts) for ip, ts in fails_by_ip.items()})
 

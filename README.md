@@ -22,6 +22,11 @@ attacking, how hard, and whether any of them got in.*
 - **Recon** — attempts against invalid usernames (`admin`, `oracle`, `pi`…).
 - **Top offender IPs** by failed-login count.
 
+sshd writes two lines for one attempt against a non-existent user
+(`Invalid user X from IP` and then `Failed password for invalid user X from IP`,
+same process ID). LogSentry pairs them by PID and counts the attempt once; a
+notice with no matching `Failed` line (e.g. key-only servers) still counts once.
+
 ## Usage
 
 ```bash
@@ -40,7 +45,7 @@ Real output of `python logsentry.py sample_auth.log`:
 ```
 LogSentry report
 ================================================
-lines parsed:        22
+lines parsed:        31
 failed logins:       16
 successful logins:   6
 unique source IPs:   4
