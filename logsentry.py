@@ -31,7 +31,8 @@ def _print_report(r: dict) -> None:
     if r["compromised"]:
         print("\n[!!] LIKELY COMPROMISE - brute force followed by a successful login:")
         for c in r["compromised"]:
-            print(f"     {c['ip']}  ({c['total_failures']} failed, then logged in)")
+            print(f"     {c['ip']}  ({c['total_failures']} failed, then logged in at "
+                  f"{_fmt_ts(c['first_success_after_burst'])})")
 
     if r["brute_force"]:
         print("\n[!] Brute-force sources:")
@@ -61,19 +62,20 @@ def main(argv=None) -> int:
                    help="failed logins from one IP within the window to flag as brute force (default 5)")
     p.add_argument("--window", type=int, default=60,
                    help="time window in seconds for the threshold (default 60)")
-    p.add_argument("--year", type=int, default=2024,
-                   help="year to assume for syslog timestamps (default 2024)")
+    p.add_argument("--year", type=int, default=None,
+                   help="year to assume for syslog timestamps (default: infer the most "
+                        "recent past date; ISO-8601 timestamps carry their own year)")
     p.add_argument("--json", action="store_true", help="emit findings as JSON")
     args = p.parse_args(argv)
 
     try:
+        # Stream the file line by line instead of loading it all into memory.
         with open(args.logfile, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+            r = analyze(f, threshold=args.threshold, window_seconds=args.window,
+                        year=args.year)
     except OSError as e:
         print(f"error: cannot read {args.logfile}: {e}", file=sys.stderr)
         return 2
-
-    r = analyze(lines, threshold=args.threshold, window_seconds=args.window, year=args.year)
 
     if args.json:
         # datetimes -> ISO strings for a clean JSON payload.
